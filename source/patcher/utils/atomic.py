@@ -19,9 +19,17 @@ def fsync_dir(dirpath):
         os.close(fd)
 
 
-def atomic_replace_posix(path, data, meta_source=None):
+def check_file_version(path, expected):
+    current = os.stat(path)
+    if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+        expected.st_dev, expected.st_ino, expected.st_size, expected.st_mtime_ns
+    ):
+        raise OSError("Target changed while preparing the patch. Run the patcher again.")
+
+
+def atomic_replace(path, data, meta_source=None, *, expected_stat=None):
     """
-    Атомарная замена файла на POSIX-системах с безопасным временным файлом.
+    Атомарная замена файла через временный файл в той же директории.
 
     Args:
         path: Целевой путь файла
@@ -57,17 +65,18 @@ def atomic_replace_posix(path, data, meta_source=None):
             f.flush()
             os.fsync(f.fileno())
 
-            # Сохраняем владельца ДО chmod (chown может сбросить setuid/setgid)
-            try:
-                os.fchown(f.fileno(), st.st_uid, st.st_gid)
-            except OSError:
-                # Может не хватить прав, это не всегда критично
-                pass
+            if os.name != "nt":
+                # chown может сбросить setuid/setgid, поэтому chmod идёт после него.
+                try:
+                    os.fchown(f.fileno(), st.st_uid, st.st_gid)
+                except OSError:
+                    pass
+                os.fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
 
-            # Применяем права из оригинального файла
-            os.fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
-
-        # Атомарная замена
+        if os.name == "nt":
+            os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
+        if expected_stat is not None:
+            check_file_version(path, expected_stat)
         os.replace(tmp_path, path)
 
         # Синхронизируем директорию

@@ -33,7 +33,7 @@ from patcher.utils.console import (
 )
 
 from patcher.utils.file import file_size, format_bytes
-from patcher.utils.update import check_for_updates, open_releases_page, print_update_status_notice
+from patcher.utils.update import REPO_URL, check_for_updates, open_releases_page, print_update_status_notice
 
 from patcher.ide.discovery import (
     find_install_root,
@@ -42,8 +42,8 @@ from patcher.ide.discovery import (
     resolve_target_path,
 )
 from patcher.ide.patcher import is_already_patched, do_patch, do_restore
-from patcher.agy.discovery import find_agy_binary, resolve_agy_path
-from patcher.agy.patcher import is_already_patched as is_agy_patched, do_patch_agy, do_restore_agy
+from patcher.agy.discovery import find_agy_binary, find_ide_backend, resolve_agy_path
+from patcher.agy.patcher import get_status as get_agy_status, do_patch_agy, do_restore_agy
 
 from patcher.manager.discovery import find_manager_binary, resolve_manager_path, get_antigravity_version
 from patcher.manager.patcher import is_already_patched as is_mgr_patched, do_patch_manager, do_restore_manager
@@ -218,6 +218,16 @@ def _kv(label, value_text, value_color):
     print(f"      {label:<9}{color(value_text, value_color)}")
 
 
+def _print_agy_patch_status(label, path, *, ide_backend=False):
+    status, _ = get_agy_status(path, ide_backend=ide_backend)
+    labels = {
+        "patched": ("already patched", COLOR_YELLOW),
+        "unpatched": ("patch needed", COLOR_GREEN),
+        "unknown": ("unsupported or unreadable", COLOR_RED),
+    }
+    _kv(label, *labels[status])
+
+
 def print_target_info(main_js_path, manager_path="", agy_path="", vscode_path="", vscode_agy_path="", show_search_line=False):
     if show_search_line:
         info("Searching for installations...")
@@ -246,6 +256,12 @@ def print_target_info(main_js_path, manager_path="", agy_path="", vscode_path=""
     else:
         _kv("Status:", "not found", COLOR_RED)
 
+    if os.name == "nt":
+        backend = find_ide_backend()
+        _kv("Backend:", backend or "agy.exe not found in ~/.gemini/bin", COLOR_CYAN)
+        if backend:
+            _print_agy_patch_status("Backend patch:", backend, ide_backend=True)
+
     print()
 
     # 2. Antigravity 2.0 Info
@@ -273,9 +289,7 @@ def print_target_info(main_js_path, manager_path="", agy_path="", vscode_path=""
     _kv("Target:", agy_path if agy_path else "Not found", COLOR_CYAN)
     if agy_path and os.path.isfile(agy_path):
         _kv("Status:", "found", COLOR_GREEN)
-        patched = is_agy_patched(agy_path)
-        _kv("Patch:", "already patched" if patched else "not patched",
-            COLOR_YELLOW if patched else COLOR_GREEN)
+        _print_agy_patch_status("Patch:", agy_path)
         size = file_size(agy_path)
         _kv("Size:", format_bytes(size), COLOR_GREEN if size > 0 else COLOR_YELLOW)
     else:
@@ -306,9 +320,7 @@ def print_target_info(main_js_path, manager_path="", agy_path="", vscode_path=""
     _kv("AGY Bin:", vscode_agy_path if vscode_agy_path else "Not found", COLOR_CYAN)
     if vscode_agy_path and os.path.isfile(vscode_agy_path):
         _kv("Status:", "found", COLOR_GREEN)
-        patched = is_agy_patched(vscode_agy_path)
-        _kv("Patch:", "already patched" if patched else "not patched",
-            COLOR_YELLOW if patched else COLOR_GREEN)
+        _print_agy_patch_status("Patch:", vscode_agy_path)
         size = file_size(vscode_agy_path)
         _kv("Size:", format_bytes(size), COLOR_GREEN if size > 0 else COLOR_YELLOW)
     else:
@@ -529,7 +541,7 @@ def run_cli():
 
     while True:
         print_menu_section("PATCH")
-        print_menu_row("1", "Antigravity IDE patch", "bypass region lock (isGoogleInternal)", COLOR_GREEN)
+        print_menu_row("1", "Antigravity IDE patch", "main.js + backend auth on Windows x64", COLOR_GREEN)
         print_menu_row("2", "Antigravity 2.0 patch", "patch language_server binary", COLOR_GREEN)
         print_menu_row("3", "Antigravity CLI (agy) patch", "unlock agy tool", COLOR_GREEN)
         print_menu_row("4", "Antigravity VS Code Patch", "patch google.google-antigravity extension.js + agy binary", COLOR_GREEN)
@@ -632,9 +644,8 @@ def run_cli():
                               vscode_agy_path=vscode_agy_path, show_search_line=searched)
             print()
             if confirmed("Open GitHub repository in browser?"):
-                url = "https://github.com/AvenCores/open-antigravity-unlock"
-                webbrowser.open(url)
-                ok(f"Opening: {color(url, COLOR_CYAN)}")
+                webbrowser.open(REPO_URL)
+                ok(f"Opening: {color(REPO_URL, COLOR_CYAN)}")
             else:
                 cancel("Cancelled.")
         elif choice == "11":

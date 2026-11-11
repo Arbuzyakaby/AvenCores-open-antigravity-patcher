@@ -31,7 +31,7 @@ from patcher.utils.file import (
 )
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
-from patcher.utils.atomic import atomic_replace_posix, apply_patches_to_data
+from patcher.utils.atomic import atomic_replace, apply_patches_to_data
 
 BAK_EXT = ".agybak"
 
@@ -339,7 +339,7 @@ def do_patch_manager(path):
                 # (на macOS каталог .app может нести uchg — снимаем перед mkstemp)
                 if sys.platform == "darwin":
                     ensure_macos_writable(path)
-                atomic_replace_posix(path, bytes(bdata))
+                atomic_replace(path, bdata)
 
             write_success = True
             break
@@ -436,7 +436,7 @@ def do_restore_manager(path):
                 bak_data = f.read()
 
             # Атомарная замена с метаданными из бэкапа
-            atomic_replace_posix(path, bak_data, meta_source=bak)
+            atomic_replace(path, bak_data, meta_source=bak)
 
         fix_posix_permissions(path)
     except Exception as e:

@@ -4,6 +4,8 @@ import re
 import time
 import shutil
 
+from patcher.agy.discovery import find_ide_backend
+from patcher.agy.patcher import do_patch_agy, do_restore_agy, get_status as get_agy_status
 from patcher.constants import (
     MIN_AG_VERSION,
 )
@@ -16,6 +18,7 @@ from patcher.utils.console import (
     step,
     print_panel,
 )
+from patcher.utils.atomic import atomic_replace
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
 from patcher.utils.file import (
@@ -123,8 +126,23 @@ def warn_about_unsafe_backup(main_js_path, installed_version_str=None, current_c
 
 
 def do_patch(main_js_path, show_search_line=False):
+    if not _patch_main_js(main_js_path):
+        return
+    if os.name == "nt":
+        backend = find_ide_backend()
+        if not backend:
+            warn(r"IDE backend not found at %USERPROFILE%\.gemini\bin\agy.exe.")
+            hint("Start Antigravity IDE so it can download the backend, then close it and run option 1 again.")
+            return
+        if not do_patch_agy(backend, ide_backend=True):
+            warn("IDE patch incomplete. main.js is patched, but the backend patch failed.")
+            return
+    print_panel("PATCH COMPLETE", [("Target", "Antigravity IDE")])
+    hint("Restart Antigravity IDE and sign in.")
+
+
+def _patch_main_js(main_js_path):
     from patcher.cli import confirmed
-    from patcher.utils.captcha import confirm_with_captcha
 
     if not main_js_path or not os.path.isfile(main_js_path):
         from patcher.cli import offer_download_and_block
@@ -151,8 +169,9 @@ def do_patch(main_js_path, show_search_line=False):
     # VersionStatus.OK — продолжаем без вопросов
 
     try:
-        with open(main_js_path, "r", encoding="utf-8") as f:
+        with open(main_js_path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
+            source_stat = os.fstat(f.fileno())
     except Exception as e:
         err(f"Read error: {e}")
         return
@@ -160,14 +179,13 @@ def do_patch(main_js_path, show_search_line=False):
     current_is_patched = is_already_patched(content)
 
     if current_is_patched:
-        hint("File appears already patched.")
-        if not confirm_with_captcha("Apply main.js patches anyway?"):
-            return
+        ok("main.js is already patched.")
+        return True
 
     # --- БЭКАП ---
     backup_path = main_js_path + ".bak"
 
-    if not os.path.exists(backup_path) and not current_is_patched:
+    if not os.path.exists(backup_path):
         info("Creating backup...")
         if sys.platform == "darwin":
             app_path = find_app_bundle(main_js_path)
@@ -200,10 +218,8 @@ def do_patch(main_js_path, show_search_line=False):
         except Exception as e:
             err(f"Backup error: {e}")
             return
-    elif os.path.exists(backup_path):
+    else:
         hint("Backup already exists — skipping")
-    elif current_is_patched:
-        warn("main.js is already patched — no backup needed")
 
     hash_before = file_hash(main_js_path)
 
@@ -219,10 +235,6 @@ def do_patch(main_js_path, show_search_line=False):
         step(r["Name"], r.get("Applied", False), r.get("Detail", ""))
     print()
 
-    if new_content == content and current_is_patched:
-        ok("File is already patched — no changes needed.")
-        return
-
     if applied == 0:
         err("No patches applied.")
         handle_patch_failure()
@@ -231,8 +243,7 @@ def do_patch(main_js_path, show_search_line=False):
     write_success = False
     for attempt in range(2):
         try:
-            with open(main_js_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
+            atomic_replace(main_js_path, new_content.encode("utf-8"), expected_stat=source_stat)
             fix_posix_permissions(main_js_path)
             write_success = True
             break
@@ -287,11 +298,18 @@ def do_patch(main_js_path, show_search_line=False):
         panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
         panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
     panel_rows.append(("Done", time.strftime('%H:%M:%S')))
-    print_panel("PATCH COMPLETE", panel_rows)
-    hint("Restart Antigravity IDE and sign in.")
+    print_panel("MAIN.JS PATCHED", panel_rows)
+    return True
 
 
 def do_restore(main_js_path, show_search_line=False):
+    _restore_main_js(main_js_path)
+    backend = find_ide_backend()
+    if backend and get_agy_status(backend, ide_backend=True)[0] == "patched":
+        do_restore_agy(backend, ide_backend=True)
+
+
+def _restore_main_js(main_js_path):
     from patcher.cli import confirmed
 
     current_content = None
@@ -313,7 +331,7 @@ def do_restore(main_js_path, show_search_line=False):
         err(f"Backup file not found: {backup_path}")
         return
     try:
-        with open(backup_path, "r", encoding="utf-8") as f:
+        with open(backup_path, "r", encoding="utf-8", newline="") as f:
             data = f.read()
     except Exception as e:
         err(f"Could not read backup: {e}")
@@ -346,7 +364,7 @@ def do_restore(main_js_path, show_search_line=False):
             if app_path:
                 remove_macos_immutable_flags(app_path)
                 remove_macos_quarantine(app_path)
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             f.write(data)
         os.replace(tmp_path, main_js_path)
         fix_posix_permissions(main_js_path)
@@ -359,7 +377,7 @@ def do_restore(main_js_path, show_search_line=False):
                 remove_macos_quarantine(app_path)
             try:
                 if not os.path.exists(tmp_path):
-                     with open(tmp_path, "w", encoding="utf-8") as f:
+                     with open(tmp_path, "w", encoding="utf-8", newline="") as f:
                          f.write(data)
                 os.replace(tmp_path, main_js_path)
                 fix_posix_permissions(main_js_path)
@@ -388,4 +406,4 @@ def do_restore(main_js_path, show_search_line=False):
         panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
         panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
     panel_rows.append(("Done", time.strftime('%H:%M:%S')))
-    print_panel("RESTORE COMPLETE", panel_rows)
+    print_panel("MAIN.JS RESTORED", panel_rows)

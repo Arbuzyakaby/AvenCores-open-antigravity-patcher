@@ -91,7 +91,15 @@ def find_agy_binary():
         hits = _win_find() if os.name == "nt" else _posix_find()
     except Exception:
         return ""
-    return hits[0] if hits else ""
+    return hits[0] if hits else find_ide_backend()
+
+
+def find_ide_backend():
+    """Windows-бэкенд IDE из профиля пользователя."""
+    if os.name != "nt":
+        return ""
+    path = os.path.expanduser(r"~\.gemini\bin\agy.exe")
+    return path if os.path.isfile(path) else ""
 
 
 def resolve_agy_path(raw_path):

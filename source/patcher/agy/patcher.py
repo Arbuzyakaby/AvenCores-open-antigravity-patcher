@@ -6,6 +6,9 @@ import mmap
 import shutil
 import contextlib
 import filecmp
+import struct
+import tempfile
+from itertools import islice
 
 from patcher.constants import COLOR_CYAN
 from patcher.utils.console import (
@@ -29,7 +32,7 @@ from patcher.utils.file import (
 )
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
-from patcher.utils.atomic import atomic_replace_posix, apply_patches_to_data
+from patcher.utils.atomic import atomic_replace, apply_patches_to_data, check_file_version
 
 BAK_EXT = ".agybak"
 
@@ -96,6 +99,41 @@ class MultiGate:
         if not matches:
             raise err or LookupError("no gate signature matched")
         return matches
+
+
+class IdeAuthGate:
+    """Уникальный участок PersonalAuthValidator.Validate в Windows x64."""
+
+    orig = bytes.fromhex("80 78 08 00 74 3b")
+    fix = bytes.fromhex("c6 40 08 01 90 90")
+    desc = "IDE backend auth (x64)"
+    # call ValidateAndOnboardAccount; test rbx,rbx; jne error;
+    # затем проверка флага и две записи данных авторизации.
+    signature = re.compile(
+        rb"\x45\x31\xc9\xe8....\x48\x85\xdb\x75\x41"
+        rb"(?P<check>" + re.escape(orig) + b"|" + re.escape(fix) + rb")"
+        rb"\x48\x8b\x54\x24\x70\x48\x89\x50\x60"
+        rb"\x48\x8b\x54\x24\x78\x48\x89\x50\x68",
+        re.S,
+    )
+
+    def resolve_all(self, data):
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            return []
+        pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe_offset:pe_offset + 6] != b"PE\x00\x00\x64\x86":
+            return []
+        matches = list(islice(self.signature.finditer(data), 2))
+        if not matches:
+            return []
+        if len(matches) > 1:
+            raise LookupError("IDE backend signature is ambiguous")
+        match = matches[0]
+        state = "patched" if match["check"] == self.fix else "unpatched"
+        return [(state, [match.start("check")], self)]
+
+
+IDE_AUTH_GATE = IdeAuthGate()
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +214,17 @@ ALL_GATES = [
 ]
 
 
+def _resolve_gates(data, ide_backend):
+    matches = IDE_AUTH_GATE.resolve_all(data)
+    if ide_backend:
+        if not matches:
+            raise LookupError("IDE backend signature not found (unsupported build)")
+        return matches
+    for gate, _ in ALL_GATES:
+        matches.extend(gate.resolve_all(data))
+    return matches
+
+
 @contextlib.contextmanager
 def _scan_data(f):
     # Reading a modified signed Mach-O through mmap can cause an uncatchable
@@ -226,26 +275,17 @@ def is_locked(path):
         return True
 
 
-def get_status(path):
+def get_status(path, *, ide_backend=False):
     """('patched'|'unpatched'|'unknown', None) — без исключений наружу.
     'patched' только если ВСЕ гейты применены."""
     if not path or not os.path.isfile(path):
         return ("unknown", None)
     try:
         with _mapped(path) as d:
-            states = []
-            for gate, _ in ALL_GATES:
-                try:
-                    for state, _offsets, _g in gate.resolve_all(d):
-                        states.append(state)
-                except LookupError:
-                    return ("unknown", None)
-            if all(s == "patched" for s in states):
-                return ("patched", None)
-            if all(s == "unpatched" for s in states):
-                return ("unpatched", None)
-            return ("unpatched", None)  # частично применён — считаем unpatched
-    except OSError:
+            matches = _resolve_gates(d, ide_backend)
+            return ("patched" if all(state == "patched" for state, _, _ in matches)
+                    else "unpatched", None)
+    except (LookupError, OSError):
         return ("unknown", None)
 
 
@@ -254,35 +294,29 @@ def is_already_patched(path):
     return get_status(path)[0] == "patched"
 
 
-def _make_backup(path):
-    """Снимок чистого файла как <path>.agybak.
-    Вызывается только когда файл unpatched — живые байты это pristine-оригинал.
-    Бэкап, не совпадающий с файлом, устарел (приложение автообновилось) —
-    обновляем его, а не храним."""
+def _make_backup(path, has_patches, expected_stat):
+    """Обновляет бэкап после автообновления, сохраняя оригинал при допатчивании."""
     bak = path + BAK_EXT
     if os.path.exists(bak):
-        if filecmp.cmp(path, bak, shallow=False):
-            return  # бэкап уже соответствует этому билду
+        if has_patches or filecmp.cmp(path, bak, shallow=False):
+            return
         info(f"Backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK_EXT}")
     else:
         info(f"Creating backup -> {os.path.basename(path)}{BAK_EXT}")
+        if has_patches:
+            warn("The original backup is missing. Saving the current, partially patched binary.")
     if sys.platform == "darwin":
         ensure_macos_writable(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".agy-backup-", dir=os.path.dirname(bak) or ".")
+    os.close(fd)
     try:
-        shutil.copy2(path, bak)
-    except (PermissionError, OSError) as e:
-        need_retry = (
-            sys.platform == "darwin"
-            and isinstance(e, OSError)
-            and e.errno in (errno.EPERM, errno.EACCES)
-        )
-        if need_retry:
-            warn("Backup blocked by macOS flags, retrying after removing flags...")
-            ensure_macos_writable(path)
-            shutil.copy2(path, bak)
-        else:
-            raise
-    fix_posix_permissions(bak)
+        shutil.copy2(path, tmp_path)
+        fix_posix_permissions(tmp_path)
+        check_file_version(path, expected_stat)
+        os.replace(tmp_path, bak)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
     ok(f"Backup: {os.path.basename(bak)} ({format_bytes(file_size(bak))})")
 
 
@@ -308,142 +342,79 @@ def _copy_to_user_bin(path):
         warn(f"Could not copy file to {dest_path}: {e}")
 
 
-def do_patch_agy(path):
+def do_patch_agy(path, *, ide_backend=False):
     from patcher.cli import confirmed
-    from patcher.utils.captcha import confirm_with_captcha
 
     if not path or not os.path.isfile(path):
         from patcher.cli import offer_download_and_block
         offer_download_and_block("Antigravity CLI")
-        return
+        return False
 
-    hash_before = file_hash(path)
     info(f"Target: {color(path, COLOR_CYAN)}")
     hint(f"Size: {color(format_bytes(file_size(path)), COLOR_CYAN)}")
     print()
 
-    write_success = False
-    patches = []  # [(offset, gate), ...] — гейты, требующие записи
+    app = "Antigravity IDE" if ide_backend else "Antigravity CLI"
     for attempt in range(2):
         if is_locked(path):
             if attempt == 0:
-                warn("Binary is locked (Antigravity CLI is running).")
-                if confirmed("Would you like to automatically close running agy processes and retry?"):
-                    terminate_processes(["agy"])
+                warn(f"Binary is locked. Close {app} before patching.")
+                if confirmed("Close running Antigravity processes and retry?"):
+                    names = ["agy"]
+                    if ide_backend:
+                        names += ["Antigravity IDE", "antigravity-ide"]
+                    terminate_processes(names)
                     import time
                     time.sleep(1.5)
                     continue
-            err("File is locked — close Antigravity CLI first.")
-            return
+            err(f"File is locked — close {app} first.")
+            return False
 
-        # Сканируем в mmap, закрываем ДО записи (zero-copy scan)
-        patches = []
         try:
-            with _mapped(path) as d:
-                all_patched = True
-                for gate_obj, gate_label in ALL_GATES:
-                    try:
-                        matches = gate_obj.resolve_all(d)
-                    except LookupError as e:
-                        err(f"{gate_label}: {e}")
-                        handle_patch_failure()
-                        return
-                    for kind, offsets, g in matches:
-                        if kind == "unpatched":
-                            all_patched = False
-                            for off in offsets:
-                                patches.append((off, g))
-                if all_patched:
-                    hint("agy already patched (all gates).")
-                    if not confirm_with_captcha("Apply patch anyway?"):
-                        return
-                    # re-patch: перезаписываем все гейты
-                    patches = []
-                    for gate_obj, _ in ALL_GATES:
-                        for _kind, offsets, g in gate_obj.resolve_all(d):
-                            for off in offsets:
-                                patches.append((off, g))
+            with open(path, "rb") as source:
+                source_stat = os.fstat(source.fileno())
+                with _scan_data(source) as data:
+                    matches = _resolve_gates(data, ide_backend)
+                    patches = [(offset, gate) for state, offsets, gate in matches
+                               if state == "unpatched" for offset in offsets]
+                    if not patches:
+                        ok(f"{app} binary is already patched.")
+                        return True
+                    has_patches = any(state == "patched" for state, _, _ in matches)
+                    if ide_backend:
+                        has_patches = has_patches or any(g.patched.search(data) for g in CLI_GATE.gates)
+                    bdata = bytearray(data)
+        except LookupError as e:
+            err(f"{app}: {e}")
+            if not ide_backend:
+                handle_patch_failure()
+            return False
         except OSError as e:
             err(f"Read error: {e}")
-            return
-
-        if not patches:
-            return
+            return False
 
         try:
-            _make_backup(path)
-        except (PermissionError, OSError) as e:
-            err(f"Backup error: {e}")
+            check_file_version(path, source_stat)
+            hash_before = file_hash(path)
+            apply_patches_to_data(bdata, patches)
+            _make_backup(path, has_patches, source_stat)
             if sys.platform == "darwin":
-                hint("macOS blocked writing (Errno 1 Operation not permitted).")
-                hint("Close Antigravity, then re-run the patcher with sudo:")
-                hint("  sudo python main.py   (or sudo ./Open_AG_Patcher)")
-            else:
-                hint("No write access — re-run as admin/root and close agy first.")
-            handle_patch_failure()
-            return
-
-        try:
-            if os.name == "nt":
-                # Windows: прямая запись с проверкой блокировки
-                with open(path, "r+b") as f:
-                    bdata = bytearray(f.read())
-                    bdata = apply_patches_to_data(bdata, patches)
-                    f.seek(0)
-                    f.write(bdata)
-                    f.flush()
-                    os.fsync(f.fileno())
-            else:
-                # POSIX: атомарная замена через временный файл
-                with open(path, "rb") as f:
-                    bdata = bytearray(f.read())
-
-                bdata = apply_patches_to_data(bdata, patches)
-
-                # Атомарная замена с безопасным временным файлом
-                if sys.platform == "darwin":
-                    ensure_macos_writable(path)
-                atomic_replace_posix(path, bytes(bdata))
-
-            write_success = True
+                ensure_macos_writable(path)
+            atomic_replace(path, bdata, expected_stat=source_stat)
             break
-        except PermissionError as e:
-            if attempt == 0:
-                if sys.platform == "darwin":
-                    warn(f"Write blocked by macOS (flags/owner): {e}")
-                    ensure_macos_writable(path)
-                    import time
-                    time.sleep(0.5)
-                    continue
-                warn(f"Permission denied (file locked): {e}")
-                if confirmed("Would you like to automatically close running agy processes and retry?"):
-                    terminate_processes(["agy"])
-                    import time
-                    time.sleep(1.5)
-                    continue
-            err(f"Write error (Permission denied): {e}")
-            if sys.platform == "darwin":
-                hint("Close Antigravity and re-run with sudo: sudo python main.py")
-            handle_patch_failure()
-            return
-        except OSError as e:
-            if e.errno in (errno.EPERM, errno.EACCES) and attempt == 0 and sys.platform == "darwin":
+        except (OSError, ValueError) as e:
+            if (isinstance(e, OSError) and e.errno in (errno.EPERM, errno.EACCES)
+                    and attempt == 0 and sys.platform == "darwin"):
                 warn(f"Write blocked by macOS (flags/owner): {e}")
                 ensure_macos_writable(path)
                 import time
                 time.sleep(0.5)
                 continue
-            err(f"Write error: {e}")
-            handle_patch_failure()
-            return
-        except Exception as e:
-            err(f"Write error: {e}")
-            handle_patch_failure()
-            return
-
-    if not write_success:
-        handle_patch_failure()
-        return
+            err(f"Could not back up or replace {path}: {e}")
+            hint(f"Close {app} and retry with write access to the binary and its folder.")
+            return False
+    else:
+        return False
 
     hash_after = file_hash(path)
     resign_macos_bundle(path)
@@ -461,11 +432,13 @@ def do_patch_agy(path):
     if hash_before and hash_after:
         panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
         panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
-    print_panel("PATCH COMPLETE", panel_rows)
-    hint("Restart Antigravity CLI for the change to take effect.")
+    print_panel("IDE BACKEND PATCHED" if ide_backend else "PATCH COMPLETE", panel_rows)
+    if not ide_backend:
+        hint("Restart Antigravity CLI for the change to take effect.")
+    return True
 
 
-def do_restore_agy(path):
+def do_restore_agy(path, *, ide_backend=False):
     from patcher.cli import confirmed
 
     if not os.path.isfile(path):
@@ -477,7 +450,7 @@ def do_restore_agy(path):
         warn(f"No backup for {os.path.basename(path)} (nothing to restore).")
         return
 
-    status, _ = get_status(path)
+    status, _ = get_status(path, ide_backend=ide_backend)
     if status != "patched":
         warn("agy is not patched — skipping restore (backup may be a different build).")
         if not confirmed("Restore from backup anyway?"):
@@ -494,18 +467,12 @@ def do_restore_agy(path):
 
     hash_before = file_hash(path)
     try:
-        if os.name == "nt":
-            shutil.copy2(bak, path)
-        else:
-            # Читаем бэкап в память
-            with open(bak, "rb") as f:
-                bak_data = f.read()
-
-            # Атомарная замена с метаданными из бэкапа
-            atomic_replace_posix(path, bak_data, meta_source=bak)
+        with open(bak, "rb") as f:
+            bak_data = f.read()
+        atomic_replace(path, bak_data, meta_source=bak)
 
         fix_posix_permissions(path)
-    except Exception as e:
+    except (OSError, ValueError) as e:
         err(f"Restore error: {e}")
         return
 

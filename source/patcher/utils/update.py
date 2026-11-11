@@ -8,9 +8,10 @@ from patcher.constants import VERSION, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, CO
 from patcher.utils.console import color, link, info, ok, warn, err, hint, _frame_border, _frame_row
 
 
-GITHUB_REPO = "AvenCores/open-antigravity-patcher"
-RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
-ISSUES_URL = f"https://github.com/{GITHUB_REPO}/issues"
+GITHUB_REPO = "Arbuzyakaby/AvenCores-open-antigravity-patcher"
+REPO_URL = f"https://github.com/{GITHUB_REPO}"
+RELEASES_URL = f"{REPO_URL}/releases"
+ISSUES_URL = f"{REPO_URL}/issues"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GOIDA_VPN_URL = "https://github.com/AvenCores/goida-vpn-configs"
 
