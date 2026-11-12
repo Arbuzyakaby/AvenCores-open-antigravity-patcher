@@ -207,6 +207,10 @@ def find_install_root():
         except ImportError:
             pass
 
+        profile = os.environ.get("USERPROFILE")
+        if profile:
+            candidates.append(os.path.join(profile, "AppData", "Local", "Programs", "Antigravity IDE"))
+
     for path in candidates:
         for sub in [
             os.path.join("resources", "app", "out", "main.js"),
@@ -243,7 +247,7 @@ def find_main_js(root):
 
 
 def get_ag_version(main_js_path):
-    """Читает версию Antigravity IDE из реестра Windows, Info.plist на macOS или package.json на Linux.
+    """Читает версию выбранной копии Antigravity IDE или данные об установке из системы.
     Возвращает (version_str, is_pkg_mgr).
     """
     # macOS: читаем версию из Info.plist
@@ -339,6 +343,18 @@ def get_ag_version(main_js_path):
         return None, False
 
     if os.name == "nt":
+        app_dir = os.path.dirname(main_js_path)
+        if os.path.basename(app_dir).lower() == "out":
+            app_dir = os.path.dirname(app_dir)
+        try:
+            with open(os.path.join(app_dir, "product.json"), encoding="utf-8") as f:
+                product = json.load(f)
+            version = product.get("ideVersion") if isinstance(product, dict) else None
+            if isinstance(version, str) and version.strip():
+                return version.strip(), False
+        except (OSError, ValueError):
+            pass
+
         try:
             import winreg
             for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):

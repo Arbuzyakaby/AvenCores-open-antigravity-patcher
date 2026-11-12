@@ -31,6 +31,7 @@ from patcher.utils.file import (
     remove_macos_quarantine,
     find_app_bundle,
 )
+from patcher.ide.backend_updates import set_backend_pinning
 from patcher.ide.discovery import (
     check_ag_version,
     parse_version_safe,
@@ -137,6 +138,9 @@ def do_patch(main_js_path, show_search_line=False):
         if not do_patch_agy(backend, ide_backend=True):
             warn("IDE patch incomplete. main.js is patched, but the backend patch failed.")
             return
+        if not set_backend_pinning(main_js_path, enabled=True):
+            warn("IDE patch incomplete. An automatic update may replace the patched backend.")
+            return
     print_panel("PATCH COMPLETE", [("Target", "Antigravity IDE")])
     hint("Restart Antigravity IDE and sign in.")
 
@@ -159,7 +163,7 @@ def _patch_main_js(main_js_path):
         if not confirmed("Proceed anyway?"):
             return
     elif ver_status == VersionStatus.NOT_FOUND:
-        warn("Could not detect Antigravity IDE version (registry key not found).")
+        warn("Could not detect Antigravity IDE version.")
         if not confirmed("Proceed without version check?"):
             return
     elif ver_status == VersionStatus.PARSE_ERROR:
@@ -303,7 +307,10 @@ def _patch_main_js(main_js_path):
 
 
 def do_restore(main_js_path, show_search_line=False):
-    _restore_main_js(main_js_path)
+    if not _restore_main_js(main_js_path):
+        return
+    if os.name == "nt" and not set_backend_pinning(main_js_path, enabled=False):
+        return
     backend = find_ide_backend()
     if backend and get_agy_status(backend, ide_backend=True)[0] == "patched":
         do_restore_agy(backend, ide_backend=True)
@@ -407,3 +414,4 @@ def _restore_main_js(main_js_path):
         panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
     panel_rows.append(("Done", time.strftime('%H:%M:%S')))
     print_panel("MAIN.JS RESTORED", panel_rows)
+    return True
